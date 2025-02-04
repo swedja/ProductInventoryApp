@@ -4,12 +4,16 @@ import com.example.demo.dto.*;
 import com.example.demo.exception.ProductNotFoundException;
 import com.example.demo.model.Product;
 import com.example.demo.repository.ProductRepository;
+import jakarta.persistence.criteria.Predicate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 
+import java.lang.reflect.Field;
+import java.util.ArrayList;
 import java.util.List;
 
 @Service
@@ -26,26 +30,9 @@ public class ProductService implements IProductService {
     public List<ProductDTO> getAllProducts(ProductRequest productRequest) {
         Pageable pageable = handlePaging(productRequest.getPaginationRequest());
         Filter filter = productRequest.getFilter();
-        if(filter != null) {
-            if (filter.getName() != null && !filter.getName().isEmpty() && filter.getPriceRange() == null) {
-                return productRepository.findByName(filter.getName()).stream().map(this::convertToProductDTO).toList();
-            }
-            if(filter.getPriceRange() != null) {
-                if (filter.getPriceRange().getMaxPrice() != null && filter.getPriceRange().getMinPrice() != null && (filter.getName() == null || filter.getName().isEmpty())) {
-                    return productRepository.findByPriceBetween(filter.getPriceRange().getMinPrice(), filter.getPriceRange().getMaxPrice()).stream().map(this::convertToProductDTO).toList();
-                }
-                if (filter.getName() != null && !filter.getName().isEmpty() && filter.getPriceRange().getMinPrice() != null && filter.getPriceRange().getMaxPrice() != null) {
-                    return productRepository.findByName(filter.getName())
-                            .stream()
-                            .filter(product ->
-                                    product.getPrice() >= filter.getPriceRange().getMinPrice() && product.getPrice() <= filter.getPriceRange().getMaxPrice())
-                            .map(this::convertToProductDTO)
-                            .toList();
-                }
-            }
-        }
-        return productRepository.findAll(pageable)
-                .getContent()
+        Specification<Product> specification = buildProductSpecification(filter);
+
+        return productRepository.findAll(specification, pageable).getContent()
                 .stream()
                 .map(this::convertToProductDTO)
                 .toList();
@@ -70,37 +57,32 @@ public class ProductService implements IProductService {
     }
 
     @Override
-    public ProductDTO updateProduct(Long id, ProductDTO updatedProduct) {
+    public ProductDTO updateProduct(Long id, UpdateProductDTO updatedProduct) {
         Product existingProduct = productRepository.findById(id)
                 .orElseThrow(() -> new ProductNotFoundException(id));
 
-        if (updatedProduct.getName() != null) {
-            existingProduct.setName(updatedProduct.getName());
-        }
-        if (updatedProduct.getDescription() != null) {
-            existingProduct.setDescription(updatedProduct.getDescription());
-        }
-        if (updatedProduct.getPrice() != null) {
-            existingProduct.setPrice(updatedProduct.getPrice());
-        }
-        if (updatedProduct.getQuantity() != null) {
-            existingProduct.setQuantity(updatedProduct.getQuantity());
-        }
+        updateNonNullProperties(updatedProduct, existingProduct);
 
         return convertToProductDTO(productRepository.save(existingProduct));
     }
 
     @Override
     public void deleteProduct(Long id) {
-        Product product = productRepository.findById(id)
-                .orElseThrow(() -> new ProductNotFoundException(id));
-        productRepository.delete(product);
+        if (!productRepository.existsById(id)) {
+            throw new ProductNotFoundException(id);
+        }
+        productRepository.deleteById(id);
     }
 
+    //convert productEntity to productDTO
     private ProductDTO convertToProductDTO(Product product) {
+        if (product == null) {
+            throw new IllegalArgumentException("Product must not be null");
+        }
         return new ProductDTO(product.getId(), product.getName(), product.getDescription(), product.getPrice(), product.getQuantity(), product.getVersion());
     }
 
+    //Pagination helper method
     Pageable handlePaging(PaginationRequest paginationRequest){
         int pageNumber = 0;
         int pageSize = 10;
@@ -125,6 +107,7 @@ public class ProductService implements IProductService {
         return PageRequest.of(pageNumber, pageSize, sort);
     }
 
+    //Sort
     private Sort getSort(SortDirection sortDirection, String sortField)
     {
         if (sortField == null)
@@ -147,6 +130,48 @@ public class ProductService implements IProductService {
                 return Sort.unsorted();
             }
         }
+    }
+
+    //Reflection for fields update
+    public static void updateNonNullProperties(Object source, Object target) {
+        try {
+            Field[] fields = source.getClass().getDeclaredFields();
+            for (Field field : fields) {
+                field.setAccessible(true);
+                Object value = field.get(source);
+                if (value != null) {
+                    Field targetField = target.getClass().getDeclaredField(field.getName());
+                    targetField.setAccessible(true);
+                    targetField.set(target, value);
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to update properties", e);
+        }
+    }
+
+    private Specification<Product> buildProductSpecification(Filter filter) {
+        return (root, query, criteriaBuilder) -> {
+            List<Predicate> predicates = new ArrayList<>();
+
+            // Apply filter by name
+            if (filter != null && filter.getName() != null && !filter.getName().isEmpty()) {
+                predicates.add(criteriaBuilder.like(criteriaBuilder.lower(root.get("name")), "%" + filter.getName().toLowerCase() + "%"));
+            }
+
+            // Apply filter for price range
+            if (filter != null && filter.getPriceRange() != null) {
+                if (filter.getPriceRange().getMinPrice() != null) {
+                    predicates.add(criteriaBuilder.greaterThanOrEqualTo(root.get("price"), filter.getPriceRange().getMinPrice()));
+                }
+                if (filter.getPriceRange().getMaxPrice() != null) {
+                    predicates.add(criteriaBuilder.lessThanOrEqualTo(root.get("price"), filter.getPriceRange().getMaxPrice()));
+                }
+            }
+
+            // Combine predicates
+            return criteriaBuilder.and(predicates.toArray(new Predicate[0]));
+        };
     }
 
 }
